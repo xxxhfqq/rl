@@ -2,3 +2,4 @@ data/
 FinRL/
 __pycache__/
 FinRL-Tutorials/
+.env
