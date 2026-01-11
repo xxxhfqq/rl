@@ -3,29 +3,24 @@
 从本地 CSV 加载分钟数据 + 技术指标 + PPO 训练 + 2025 测试回测
 """
 
-import os
 import sys
 import argparse
 import warnings
 
 import pandas as pd
 from pathlib import Path
-from tqdm import tqdm
 
 from stockstats import StockDataFrame
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-import torch
-import torch.nn as nn
+# 避免 FinRL alpaca_trade_api 导入错误
+sys.modules["alpaca_trade_api"] = type(sys)("dummy_alpaca")
+warnings.filterwarnings("ignore")
 
 from finrl.meta.env_stock_trading.env_stocktrading import StockTradingEnv
 from finrl.agents.stablebaselines3.models import DRLAgent
 from pyfolio import timeseries
-
-# 避免 FinRL alpaca_trade_api 导入错误
-sys.modules["alpaca_trade_api"] = type(sys)("dummy_alpaca")
-warnings.filterwarnings("ignore")
 
 
 # ==============================
@@ -94,14 +89,39 @@ def add_technical_indicators(df: pd.DataFrame, indicators: list[str]) -> pd.Data
 
 
 # ==============================
-# 3) 转 FinRL 环境 index
+# 3) 对齐 FinRL StockTradingEnv 所需格式
 # ==============================
-def to_finrl_env_index(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-    df2["datetime"] = pd.to_datetime(df2["datetime"])
-    df2 = df2.sort_values(["datetime"]).reset_index(drop=True)
-    df2.index = pd.Index(pd.Series(df2["datetime"]).factorize()[0])
-    return df2
+def align_finrl_stocktrading_df(df: pd.DataFrame, tic: str) -> pd.DataFrame:
+    """
+    FinRL StockTradingEnv 关键要求：
+    - 必须有 `date` 列（env 内部读取 self.data.date）
+    - 必须有 `close` 列（env 内部读取 self.data.close）
+    - index 必须是从 0..N-1 的 “day” 整数索引（env 内部 df.loc[self.day, :]）
+    - 单股票：每个 day 只有一行；多股票：每个 day 有多个 tic 行（同一 index 重复）
+    """
+    if "datetime" not in df.columns and "date" not in df.columns:
+        raise KeyError("数据必须包含 datetime 或 date 列以对齐 FinRL")
+
+    out = df.copy()
+    if "date" not in out.columns:
+        out = out.rename(columns={"datetime": "date"})
+    out["date"] = pd.to_datetime(out["date"])
+
+    if "tic" not in out.columns:
+        out["tic"] = tic
+    else:
+        out["tic"] = out["tic"].astype(str)
+
+    # FinRL env 依赖 close / date / tech_indicator_list
+    if "close" not in out.columns:
+        raise KeyError("对齐 FinRL 失败：缺少 close 列")
+
+    out = out.sort_values(["date", "tic"]).reset_index(drop=True)
+
+    # 单股票：index 需要是 0..N-1
+    # 多股票：同一 date 的多行必须拥有相同 day index
+    out.index = pd.Index(pd.Series(out["date"]).factorize()[0])
+    return out
 
 
 # ==============================
@@ -110,9 +130,11 @@ def to_finrl_env_index(df: pd.DataFrame) -> pd.DataFrame:
 def data_split(df: pd.DataFrame, start_date: str, end_date: str) -> pd.DataFrame:
     s = pd.to_datetime(start_date)
     e = pd.to_datetime(end_date)
-    mask = (df["datetime"] >= s) & (df["datetime"] <= e)
+    if "date" not in df.columns:
+        raise KeyError("data_split 需要 date 列")
+    mask = (df["date"] >= s) & (df["date"] <= e)
     df2 = df.loc[mask].copy().reset_index(drop=True)
-    df2.index = pd.Index(pd.Series(df2["datetime"]).factorize()[0])
+    df2.index = pd.Index(pd.Series(df2["date"]).factorize()[0])
     return df2
 
 
@@ -133,41 +155,7 @@ def check_for_nan(df, fillna=False):
 
 
 # ==============================
-# 6) Transformer 网络定义（可选）
-# ==============================
-class TransformerModel(nn.Module):
-    def __init__(self, input_dim, output_dim, num_heads=4, num_layers=2, hidden_dim=128):
-        super().__init__()
-        self.embedding = nn.Linear(input_dim, hidden_dim)
-        self.transformer = nn.Transformer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            num_encoder_layers=num_layers,
-            num_decoder_layers=num_layers,
-        )
-        self.fc_out = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = self.embedding(x)
-        x = x.unsqueeze(1)
-        t = self.transformer(x, x)
-        return self.fc_out(t)
-
-
-# ==============================
-# 7) 自定义 PPO
-# ==============================
-class CustomPPO(PPO):
-    def __init__(self, *args, **kwargs):
-        policy_kwargs = kwargs.get("policy_kwargs", {})
-        policy_kwargs["net_arch"] = [128, 128]
-        policy_kwargs["actor_net"] = TransformerModel(input_dim=10, output_dim=1)
-        kwargs["policy_kwargs"] = policy_kwargs
-        super().__init__(*args, **kwargs)
-
-
-# ==============================
-# 8) 主流程
+# 6) 主流程
 # ==============================
 def main():
     p = argparse.ArgumentParser()
@@ -201,6 +189,12 @@ def main():
         default=1_000_000,
         help="PPO 总训练步数",
     )
+    p.add_argument(
+        "--tic",
+        type=str,
+        default="",
+        help="标的代码（默认从 CSV 文件名自动推断）",
+    )
     args = p.parse_args()
 
     print("[INFO] 加载本地分钟数据:", args.data_csv)
@@ -217,13 +211,14 @@ def main():
     ]
 
     df_ind = add_technical_indicators(raw_df, indicators)
-    df_ind["tic"] = args.data_csv
+    tic = args.tic.strip() or Path(args.data_csv).stem
+    df_ind["tic"] = tic
 
-    df_env = to_finrl_env_index(df_ind)
+    df_env = align_finrl_stocktrading_df(df_ind, tic=tic)
     df_env = check_for_nan(df_env, fillna=True)
 
     print("[INFO] 划分训练/测试集 ...")
-    train_start = df_env["datetime"].min().strftime("%Y-%m-%d")
+    train_start = df_env["date"].min().strftime("%Y-%m-%d")
     df_train = data_split(df_env, train_start, args.train_end)
     df_test = data_split(df_env, args.test_start, args.test_end)
     print("[DATA] 训练集:", df_train.shape, "测试集:", df_test.shape)
@@ -247,11 +242,12 @@ def main():
     train_env = DummyVecEnv([lambda: StockTradingEnv(df=df_train, **env_kwargs)])
 
     print("[TRAIN] PPO 开始训练 ...")
-    model = CustomPPO(
+    model = PPO(
         "MlpPolicy",
         train_env,
         verbose=1,
         tensorboard_log="./tensorboard/",
+        policy_kwargs={"net_arch": [128, 128]},
     )
     model.learn(total_timesteps=args.total_timesteps)
 
