@@ -53,7 +53,7 @@ class PPO:
         env_id="LunarLander-v3",
         net=ActorCriticNet,
         device="cuda",
-        seed=0,
+        seed=87569,
 
         # 采样设置
         num_envs=8,
@@ -92,7 +92,7 @@ class PPO:
 
         self.gamma = gamma
         self.gae_lambda = gae_lambda
-        self.update_epochs = update_epochs
+        self.update_epochs = update_epochs # rollout 收集到的资料被用于更新网络, 更新的epoch数
         self.minibatch_size = minibatch_size
         self.clip_coef = clip_coef
         self.clip_vloss = clip_vloss
@@ -107,7 +107,7 @@ class PPO:
         self.save_path = Path(save_path)
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # ====== env / eval_env ======
+        # ====== env and eval_env ======
         # PPO 最佳实践：训练用 vector env，并行采样
         def make_env(rank):
             def thunk():
@@ -127,7 +127,8 @@ class PPO:
         self.action_dim = int(act_space.n) # type: ignore
 
         # ====== net / optim ======
-        self.net = net(self.state_dim, self.action_dim).to(self.device)
+        self.net_class = net
+        self.net = self.net_class(self.state_dim, self.action_dim).to(self.device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr, eps=1e-5)
 
         # ====== logs ======
@@ -141,7 +142,12 @@ class PPO:
 
     def take_action(self, obs, deterministic=False):
         """
+        return: action, logprob, value.squeeze(-1), dist.entropy()
+
         obs: torch.Tensor [num_envs, state_dim] 或 [1, state_dim]
+        个人理解：
+        dist最后一个维度用于采样，其余维度作为shape,B * D， D前的维度就是sample()和entropy()的维度
+        log_prob中， action的维度要和shape保持一致，或者广播一致， 输出和输入维度一样
         """
         with torch.no_grad():
             logits, value = self.net(obs)
@@ -165,8 +171,9 @@ class PPO:
         N = self.num_envs
         D = self.state_dim
 
-        obs_buf = torch.zeros((T, N, D), device=self.device)
+        state = torch.zeros((T, N, D), device=self.device)
         actions_buf = torch.zeros((T, N), device=self.device, dtype=torch.long)
+        # 记录的数据为, 在当前step , 状态为state下, 采取action所激发的数据, 包括advantage
         logprobs_buf = torch.zeros((T, N), device=self.device)
         rewards_buf = torch.zeros((T, N), device=self.device)
 
@@ -181,7 +188,7 @@ class PPO:
         next_values_buf = torch.zeros((T, N), device=self.device)
 
         for t in range(T):
-            obs_buf[t] = obs
+            state[t] = obs # tensor两个数组之间允许逐元素赋值
 
             action, logprob, value, _ = self.take_action(obs, deterministic=False)
             actions_buf[t] = action
@@ -195,7 +202,7 @@ class PPO:
             terminated_mask = np.array(terminated, dtype=np.float32)
             dones_buf[t] = torch.tensor(terminated_mask, device=self.device, dtype=torch.float32)
 
-            # ====== 回合统计：用 terminated OR truncated ======
+            # ====== 采样的return统计 用 terminated OR truncated ======
             episode_done = np.logical_or(terminated, truncated)
             self._running_ep_return += reward.astype(np.float32)
             for i in range(N):
@@ -204,15 +211,16 @@ class PPO:
                     self._running_ep_return[i] = 0.0
 
             # ====== 关键：为 GAE 准备 “actual_next_obs” ======
-            # SAME_STEP 下，如果某个 env 结束了，next_obs[i] 已经是 reset 后的 obs，
+            # SAME_STEP 下，如果某个 env 结束了,next_obs[i] 已经是 reset 后的 obs，
             # 但我们要 bootstrap 的是 “final_obs”（真实的最后一步后继状态/终止前状态）
             actual_next_obs = next_obs
             if isinstance(infos, dict) and ("final_obs" in infos):
                 final_obs = infos["final_obs"]              # shape=(num_envs,), dtype=object
-                has_final = infos.get("_final_obs", episode_done)  # shape=(num_envs,), dtype=bool
-
+                has_final = infos.get("_final_obs", episode_done)  # shape=(num_envs,), dtype=bool，布尔掩码数组，指示final_obs数组每个对应元素是否有效
+                # 经过final_bos字段的判断， _final_obs字段是一定有的
                 if np.any(has_final):
-                    idx = np.where(has_final)[0]
+                    idx = np.where(has_final)[0] # where返回的一定是tuple, 每个元素是arr, 维度为1时取第一个
+                    # print(idx.shape)
                     # 把 object 数组里的每个元素 stack 成二维 (k, obs_dim)
                     final_stack = np.stack([final_obs[i] for i in idx]).astype(np.float32)
 
@@ -234,14 +242,14 @@ class PPO:
 
         for t in reversed(range(T)):
             next_nonterminal = 1.0 - dones_buf[t]  # 1 - terminated（truncated 仍为 1 => 会自举）
-            delta = rewards_buf[t] + self.gamma * next_values_buf[t] * next_nonterminal - values_buf[t]
-            lastgaelam = delta + self.gamma * self.gae_lambda * next_nonterminal * lastgaelam
+            delta = rewards_buf[t] + self.gamma * next_values_buf[t] * next_nonterminal - values_buf[t] # delta 是单步优势函数, 在这里截断自举
+            lastgaelam = delta + self.gamma * self.gae_lambda * next_nonterminal * lastgaelam # lastgaelam是上一步的GAE-advantage, 也可以被截断
             advantages[t] = lastgaelam
 
-        returns = advantages + values_buf
+        returns = advantages + values_buf # λ-return
 
         batch = {
-            "obs": obs_buf,
+            "obs": state,
             "actions": actions_buf,
             "logprobs": logprobs_buf,
             "values": values_buf,
@@ -264,7 +272,7 @@ class PPO:
         advantages = batch["advantages"].reshape(-1)
         returns = batch["returns"].reshape(-1)
 
-        # advantage normalize（最佳实践之一，能明显稳定训练）
+        # advantage normalize（能明显稳定训练）
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         batch_size = obs.shape[0]
@@ -397,6 +405,13 @@ class PPO:
                 action, _, _, _ = self.take_action(obs_t, deterministic=True)
                 obs, r, terminated, truncated, info = play_env.step(int(action.item()))
                 done = bool(terminated or truncated)
+    def load_best_model(self):
+        ckpt = torch.load(self.save_path, map_location="cpu")
+        self.action_dim = ckpt['action_dim']
+        self.state_dim = ckpt['state_dim']
+        
+        self.net = self.net_class(self.state_dim, self.action_dim).to(self.device)
+        self.net.load_state_dict(ckpt['net'])
 
 
 if __name__ == "__main__":
@@ -426,3 +441,41 @@ if __name__ == "__main__":
     )
     ppo.train()
     # ppo.inference()
+
+"""
+            elif self.autoreset_mode == AutoresetMode.SAME_STEP:
+        (
+            self._env_obs[i],
+            self._rewards[i],
+            self._terminations[i],
+            self._truncations[i],
+            env_info,
+        ) = self.envs[i].step(action)
+
+        if self._terminations[i] or self._truncations[i]:
+            infos = self._add_info(
+                infos,
+                {"final_obs": self._env_obs[i], "final_info": env_info},
+                i,
+            )
+
+            self._env_obs[i], env_info = self.envs[i].reset()
+    else:
+        raise ValueError(f"Unexpected autoreset mode, {self.autoreset_mode}")
+
+    infos = self._add_info(infos, env_info, i)
+
+# Concatenate the observations
+self._observations = concatenate(
+    self.single_observation_space, self._env_obs, self._observations
+)
+self._autoreset_envs = np.logical_or(self._terminations, self._truncations)
+
+return (
+    deepcopy(self._observations) if self.copy else self._observations,
+    np.copy(self._rewards),
+    np.copy(self._terminations),
+    np.copy(self._truncations),
+    infos,
+)
+"""
