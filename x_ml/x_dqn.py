@@ -26,8 +26,10 @@ class Q_net(nn.Module):
     def forward(self, x):
         x = self.net(x)
         return x
+    
 def cal_decay(num_episode, epsilon_start, epsilon_end):
     return (epsilon_end / epsilon_start) ** (1 / num_episode)
+
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
@@ -80,7 +82,7 @@ class DQN():
 
         self.env = env
         self.eval_env = eval_env
-        self.action_dim = self.env.action_space.n
+        self.action_dim = self.env.action_space.n # type: ignore
         self.count = 0
 
         self.return_reward = []

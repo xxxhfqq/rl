@@ -65,7 +65,7 @@ class ActorCritic:
     ):
         self.device = device
 
-        # env / eval_env：不要写在函数默认参数里 gym.make(...)（避免导入时副作用）
+        
         self.env = gym.make(env_id)
         self.eval_env = gym.make(env_id)
 
@@ -185,7 +185,7 @@ class ActorCritic:
                     state = next_state
                     done = done_flag
 
-                # 保持你的结构：每个 episode 收集完再 update 一次
+                # 每个 episode 收集完再 update 一次
                 self.update(
                     np.array(states),
                     np.array(actions),
